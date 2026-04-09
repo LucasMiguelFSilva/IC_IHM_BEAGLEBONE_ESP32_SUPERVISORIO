@@ -36,4 +36,4 @@ O guia completo detalhando cada comando desde a gravação do cartão SD, config
 **Pedro Victor Coelho Uga**
 * Estudante de Engenharia de Controle e Automação - Universidade Federal de Uberlândia (UFU)
 
-Sinta-se à vontade para abrir *issues* ou enviar *pull requests* caso tenha dúvidas sobre a configuração do X11 ou do script Python na BeagleBone!
+Sinta-se à vontade para abrir os *arquivos* ou enviar *pull requests* caso tenha dúvidas sobre a configuração do X11 ou do script Python na BeagleBone!
