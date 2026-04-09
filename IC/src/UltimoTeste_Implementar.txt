@@ -1,0 +1,160 @@
+#include <Arduino.h>
+#include <ModbusRTU.h> // Biblioteca: emelianov/modbus-esp8266
+
+// --- Configurações do Inversor ---
+#define ID_INVERSOR 1
+
+// Registradores
+#define REG_RUN_CMD 8192
+#define REG_SET_FREQ 4096
+#define REG_LEITURA_FREQ 4097
+#define REG_LEITURA_TENSAO_SAIDA 4099
+#define REG_LEITURA_VELOCIDADE 4103
+#define REG_LEITURA_CORRENTE 28676
+
+// --- Pinos do ESP32 ---
+#define PINO_TX_RS485 17
+#define PINO_RX_RS485 16
+#define PINO_CONTROLE_RS485 4
+
+ModbusRTU mestre;
+
+// Variáveis de leitura
+uint16_t freq_raw = 0;
+uint16_t tensao_raw = 0;
+uint16_t corrente_raw = 0;
+uint16_t vel_raw = 0;
+
+// Variável para o setpoint de frequência que pode ser alterado
+uint16_t frequenciaDesejada_raw = 7500; // <-- NOVO: Valor inicial (75.00 Hz)
+
+// Variáveis de controle da máquina de estados
+int modbusState = 0;
+unsigned long proximaTarefa = 0;
+bool dadosImpressos = true;
+
+// Callback genérico
+bool cb(Modbus::ResultCode event, uint16_t, void*) {
+  if (event == Modbus::EX_SUCCESS) {
+    Serial.println("  ✔ ... Sucesso!");
+  } else {
+    Serial.printf("  ❌ ... Erro Modbus: 0x%02X\n", event);
+  }
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n==============================================");
+  Serial.println("ESP32 - Mestre Modbus com Setpoint Dinâmico");
+  Serial.println("==============================================");
+
+  Serial2.begin(9600, SERIAL_8N1, PINO_RX_RS485, PINO_TX_RS485);
+  
+  mestre.begin(&Serial2, PINO_CONTROLE_RS485);
+  mestre.master();
+
+  // <-- NOVO: Instrução para o usuário
+  Serial.println("\n>>> Digite a frequencia em Hz (ex: 60.0) e pressione Enter para alterar. <<<\n");
+}
+
+void imprimirDados() {
+  Serial.println("\n=== Dados Lidos ===");
+  Serial.printf("Frequência: %.2f Hz\n", freq_raw / 100.0);
+  Serial.printf("Velocidade: %d RPM\n", vel_raw);
+  Serial.printf("Tensão: %.1f V\n", tensao_raw);
+  Serial.printf("Corrente: %.2f A\n", corrente_raw / 100.0);
+  Serial.println("====================\n");
+}
+
+// <-- NOVO: Função para processar o comando vindo do Serial Monitor
+void processSerialInput(String input) {
+  Serial.print("Recebido: '"); Serial.print(input); Serial.println("'");
+  
+  float freqHz = input.toFloat(); // Converte o texto para um número (ex: "50.5" -> 50.5)
+  
+  // Limite de segurança (ajuste conforme seu inversor, ex: 0 a 75 Hz)
+  if (freqHz >= 0.0 && freqHz <= 75.0) { 
+    // Converte de Hz para o formato Modbus (ex: 50.5 -> 5050)
+    frequenciaDesejada_raw = (uint16_t)(freqHz * 100.0);
+    Serial.printf("  -> OK! Novo setpoint de frequencia: %.2f Hz (Valor Modbus: %u)\n", freqHz, frequenciaDesejada_raw);
+  } else {
+    Serial.println("  -> ERRO: Valor invalido ou fora da faixa (0.0 a 75.0 Hz). Tente novamente.");
+  }
+}
+
+
+void loop() {
+  mestre.task(); // Executa a lógica de fundo do Modbus
+
+  // <-- NOVO: Bloco para verificar se o usuário digitou um novo comando
+  // Isso é verificado a cada loop, de forma independente da máquina de estados
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n'); // Lê até o usuário pressionar Enter
+    input.trim(); // Limpa espaços em branco
+    
+    if (input.length() > 0) {
+      processSerialInput(input); // Envia o texto para a função de processamento
+    }
+  }
+
+  // Se a biblioteca está ocupada (mestre.slave() == true), não faça nada.
+  if (mestre.slave()) {
+    return;
+  }
+
+  // Se a biblioteca está livre E é hora da próxima tarefa
+  if (millis() > proximaTarefa) {
+
+    switch (modbusState) {
+      case 0:
+        Serial.println("-----------------------------------------");
+        Serial.println("-> (Estado 0) Enviando comando RUN (motor ligado)");
+        mestre.writeHreg(ID_INVERSOR, REG_RUN_CMD, 1, cb);
+        dadosImpressos = false; 
+        break;
+
+      case 1:
+        // <-- ALTERADO: Agora usa a variável global ao invés de um valor fixo
+        Serial.printf("-> (Estado 1) Comandando inversor para %.2f Hz\n", frequenciaDesejada_raw / 100.0);
+        mestre.writeHreg(ID_INVERSOR, REG_SET_FREQ, frequenciaDesejada_raw, cb);
+        break;
+
+      case 2:
+        Serial.println("-> (Estado 2) Solicitando Leitura de Frequência...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_FREQ, &freq_raw, 1, cb);
+        break;
+
+      case 3:
+        Serial.println("-> (Estado 3) Solicitando Leitura de Velocidade...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_VELOCIDADE, &vel_raw, 1, cb);
+        break;
+
+      case 4:
+        Serial.println("-> (Estado 4) Solicitando Leitura de Tensão...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_TENSAO_SAIDA, &tensao_raw, 1, cb);
+        break;
+
+      case 5:
+        Serial.println("-> (Estado 5) Solicitando Leitura de Corrente...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_CORRENTE, &corrente_raw, 1, cb);
+        break;
+
+      case 6:
+        if (!dadosImpressos) {
+          imprimirDados();
+          dadosImpressos = true;
+        }
+        break;
+    }
+
+    modbusState++;
+    
+    if (modbusState > 6) {
+      modbusState = 0; 
+      proximaTarefa = millis() + 5000; // 5s de espera antes de recomeçar o ciclo
+    } else {
+      proximaTarefa = millis() + 1000; // 1s entre cada comando
+    }
+  }
+}

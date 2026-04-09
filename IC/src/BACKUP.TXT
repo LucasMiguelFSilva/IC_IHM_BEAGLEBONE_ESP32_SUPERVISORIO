@@ -1,0 +1,177 @@
+#include <Arduino.h>
+#include <ModbusRTU.h>
+#include <Encoder.h>
+
+// ---------------- ENCODER ----------------
+#define ENCODER_A_PIN 2      
+#define PULSOS_POR_ROTACAO 1024
+
+// 🔬 FATOR DE CALIBRAÇÃO OBTIDO EXPERIMENTALMENTE
+// Encoder = 1804.8 RPM
+// Tacômetro = 1797.7 RPM
+// KCAL = 1797.7 / 1804.8 = 0.99606
+#define KCAL 0.99606
+
+Encoder meuEncoder(ENCODER_A_PIN, PULSOS_POR_ROTACAO);
+
+// ---------------- INVERSOR ----------------
+#define ID_INVERSOR 1
+
+// Registradores Modbus
+#define REG_RUN_CMD 8192
+#define REG_SET_FREQ 4096
+#define REG_LEITURA_FREQ 4097
+#define REG_LEITURA_TENSAO_SAIDA 4099
+#define REG_LEITURA_VELOCIDADE 4103
+#define REG_LEITURA_CORRENTE 28676
+
+#define CMD_RUN 1
+#define CMD_STOP 6
+#define CMD_REVERSO 2
+
+// ---------------- RS485 ESP32 ----------------
+#define PINO_TX_RS485 17
+#define PINO_RX_RS485 16
+#define PINO_CONTROLE_RS485 4
+
+ModbusRTU mestre;
+
+// ---------------- Variáveis Modbus ----------------
+uint16_t freq_raw = 0;
+uint16_t tensao_raw = 0;
+uint16_t corrente_raw = 0;
+uint16_t vel_raw = 0;
+
+uint16_t frequenciaDesejada_raw = 7500; 
+uint16_t comandoMotorDesejado = CMD_STOP;
+
+int modbusState = 0;
+unsigned long proximaTarefa = 0;
+
+#define MODBUS_CYCLE_TIME 200
+
+// Callback
+bool cb(Modbus::ResultCode event, uint16_t, void*) {
+  if (event != Modbus::EX_SUCCESS) {
+    Serial.printf("Erro Modbus: 0x%02X\n", event);
+  }
+  return true;
+}
+
+// ---------------- FUNÇÃO RPM CALIBRADO ----------------
+float getRPMCalibrado() {
+  float rpmBruto = meuEncoder.getRPM();
+  float rpmCalibrado = rpmBruto * KCAL;
+  return rpmCalibrado;
+}
+
+// ---------------- PRINT ----------------
+void imprimirDados() {
+  float rpmBruto = meuEncoder.getRPM();
+  float rpmCalibrado = rpmBruto * KCAL;
+
+  Serial.println("\n=== STATUS INVERSOR ===");
+  Serial.printf("Freq saída: %.2f Hz\n", freq_raw / 100.0);
+  Serial.printf("Velocidade inversor: %d RPM\n", vel_raw);
+  Serial.printf("Tensão saída: %.1f V\n", tensao_raw);
+  Serial.printf("Corrente saída: %.2f A\n", corrente_raw / 10.0);
+
+  Serial.println("\n--- ENCODER ---");
+  Serial.printf("RPM Encoder (bruto): %.2f RPM\n", rpmBruto);
+  Serial.printf("RPM Encoder CALIBRADO: %.2f RPM\n", rpmCalibrado);
+}
+
+// ---------------- SERIAL COMMAND ----------------
+void processSerialInput(String input) {
+  input.trim();
+  input.toLowerCase();
+
+  if (input == "run") {
+    comandoMotorDesejado = CMD_RUN;
+    Serial.println("RUN selecionado");
+    return;
+  }
+
+  if (input == "stop") {
+    comandoMotorDesejado = CMD_STOP;
+    Serial.println("STOP selecionado");
+    return;
+  }
+
+  if (input == "reverso") {
+    comandoMotorDesejado = CMD_REVERSO;
+    Serial.println("REVERSO selecionado");
+    return;
+  }
+
+  float freqHz = input.toFloat();
+
+  if (freqHz >= 0 && freqHz <= 80) {
+    frequenciaDesejada_raw = freqHz * 100.0;
+    Serial.printf("Nova frequência: %.2f Hz\n", freqHz);
+  } else {
+    Serial.println("Comando inválido");
+  }
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nESP32 Mestre Modbus - NFLIXIN 9600 (RPM CALIBRADO)");
+
+  meuEncoder.begin();
+
+  Serial2.begin(115200, SERIAL_8N1, PINO_RX_RS485, PINO_TX_RS485);
+  mestre.begin(&Serial2, PINO_CONTROLE_RS485);
+  mestre.master();
+
+  Serial.println("Digite: run | stop | reverso | frequencia(Hz)");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  mestre.task();
+  meuEncoder.loop();
+
+  if (Serial.available()) {
+    processSerialInput(Serial.readStringUntil('\n'));
+  }
+
+  if (mestre.slave()) return;
+
+  if (millis() > proximaTarefa) {
+
+    switch (modbusState) {
+
+      case 0:
+        mestre.writeHreg(ID_INVERSOR, REG_RUN_CMD, comandoMotorDesejado, cb);
+        break;
+
+      case 1:
+        mestre.writeHreg(ID_INVERSOR, REG_SET_FREQ, frequenciaDesejada_raw, cb);
+        break;
+
+      case 2:
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_FREQ, &freq_raw, 1, cb);
+        break;
+
+      case 3:
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_TENSAO_SAIDA, &tensao_raw, 1, cb);
+        break;
+
+      case 4:
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_CORRENTE, &corrente_raw, 1, cb);
+        break;
+
+      case 5:
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_VELOCIDADE, &vel_raw, 1, cb);
+        imprimirDados();
+        break;
+    }
+
+    modbusState++;
+    if (modbusState > 5) modbusState = 0;
+
+    proximaTarefa = millis() + MODBUS_CYCLE_TIME;
+  }
+}

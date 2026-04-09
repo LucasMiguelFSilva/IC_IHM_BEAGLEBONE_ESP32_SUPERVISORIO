@@ -1,0 +1,198 @@
+#include <Arduino.h>
+#include <ModbusRTU.h>
+#include <Encoder.h>
+
+// ---------------- ENCODER ----------------
+#define ENCODER_A_PIN 2      
+#define PULSOS_POR_ROTACAO 1024
+#define KCAL 0.99606
+Encoder meuEncoder(ENCODER_A_PIN, PULSOS_POR_ROTACAO);
+
+// ---------------- INVERSOR (MODBUS REGISTERS) ----------------
+#define ID_INVERSOR 1
+#define REG_RUN_CMD 8192
+#define REG_SET_FREQ 4096
+#define REG_LEITURA_FREQ 4097
+#define REG_LEITURA_TENSAO_SAIDA 28675
+#define REG_LEITURA_VELOCIDADE 4103
+#define REG_LEITURA_CORRENTE 28676
+
+#define CMD_RUN 1
+#define CMD_STOP 6
+#define CMD_RESET 7
+
+// ---------------- RS485 PINS ----------------
+#define PINO_TX_RS485 17
+#define PINO_RX_RS485 16
+#define PINO_CONTROLE_RS485 4
+
+ModbusRTU mestre;
+
+// ---------------- VARIÁVEIS DE ESTADO ----------------
+uint16_t freq_raw = 0, tensao_raw = 0, corrente_raw = 0, vel_raw = 0;
+uint16_t frequenciaDesejada_raw = 0;
+uint16_t comandoMotorDesejado = CMD_STOP;
+
+int modbusState = 0;
+unsigned long proximaTarefa = 0;
+#define MODBUS_CYCLE_TIME 20 
+
+// =====================================================
+//         GERADOR DE TRAJETÓRIA (RAMPA)
+// =====================================================
+float RPM_ALVO = 0.0;     
+float RPM_SETPOINT = 0.0; 
+#define PASSO_RAMPA_RPM 60.0  // 300 RPM/s em ciclos de 200ms
+
+// =====================================================
+//         CONTROLADOR PI DISCRETO
+// =====================================================
+#define TS 0.2 
+#define KP 0.02000000 
+#define I_GAIN 0.020693305
+#define B0 (KP + I_GAIN * TS)
+#define B1 (-KP)
+
+float ek = 0, ek_1 = 0;
+float uk = 0, uk_1 = 0;
+
+float controladorPI(float rpmAtual) {
+    ek = RPM_SETPOINT - rpmAtual;
+    uk = uk_1 + B0*ek + B1*ek_1;
+
+    // Saturação (Anti-windup simples: limita uk_1)
+    if(uk > 60.0) uk = 60.0; 
+    if(uk < 0.0)  uk = 0.0;
+
+    uk_1 = uk;
+    ek_1 = ek;
+    return uk;
+}
+
+// ---------------- SERIAL NÃO-BLOQUEANTE ----------------
+void checkSerial() {
+    static String inputBuffer = "";
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n') { // Processa ao dar Enter
+            inputBuffer.trim();
+            inputBuffer.toLowerCase();
+
+            if (inputBuffer == "run") {
+                comandoMotorDesejado = CMD_RUN;
+                Serial.println(">>> COMANDO: RUN");
+            } 
+            else if (inputBuffer == "stop") {
+                comandoMotorDesejado = CMD_STOP;
+                Serial.println(">>> COMANDO: STOP");
+            } 
+            else if (inputBuffer == "reset") {
+                comandoMotorDesejado = CMD_RESET;
+                Serial.println(">>> COMANDO: RESET");
+            } 
+            else if (inputBuffer.length() > 0) {
+                float novoAlvo = inputBuffer.toFloat();
+                if (novoAlvo >= 0 && novoAlvo <= 2000) {
+                    RPM_ALVO = novoAlvo;
+                    Serial.printf(">>> NOVO ALVO: %.1f RPM\n", RPM_ALVO);
+                }
+            }
+            inputBuffer = ""; 
+        } else if (c != '\r') {
+            inputBuffer += c;
+        }
+    }
+}
+
+// ---------------- RELATÓRIO SERIAL ----------------
+void imprimirDados() {
+    float rpmReal = meuEncoder.getRPM() * KCAL;
+    Serial.printf("[Satus] Alvo: %.0f | SP: %.1f | Real: %.1f | Out: %.2f Hz | I: %.1f A\n",
+                  RPM_ALVO, RPM_SETPOINT, rpmReal, (frequenciaDesejada_raw / 100.0), (corrente_raw / 10.0));
+}
+
+// =====================================================
+//         TASK DE CONTROLE (CORE 1)
+// =====================================================
+void TaskControle(void *pvParameters) {
+    unsigned long ultimoPrint = 0;
+
+    for(;;) {
+        float rpmAtual = meuEncoder.getRPM() * KCAL;
+
+        if(comandoMotorDesejado == CMD_RUN) {
+            // Atualiza Rampa
+            if (RPM_SETPOINT < RPM_ALVO) {
+                RPM_SETPOINT += PASSO_RAMPA_RPM;
+                if (RPM_SETPOINT > RPM_ALVO) RPM_SETPOINT = RPM_ALVO;
+            } 
+            else if (RPM_SETPOINT > RPM_ALVO) {
+                RPM_SETPOINT -= PASSO_RAMPA_RPM;
+                if (RPM_SETPOINT < RPM_ALVO) RPM_SETPOINT = RPM_ALVO;
+            }
+
+            // Executa PI
+            float freqCalculada = controladorPI(rpmAtual);
+            
+            // Aplica Ganho de Compensação se necessário (ex: 1.333)
+            frequenciaDesejada_raw = (uint16_t)(freqCalculada * 1.3333 * 100.0);
+        } 
+        else {
+            // Reset do controle ao parar
+            frequenciaDesejada_raw = 0;
+            RPM_SETPOINT = 0;
+            uk_1 = 0; ek_1 = 0;
+        }
+
+        if (millis() - ultimoPrint >= 1000) {
+            imprimirDados();
+            ultimoPrint = millis();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200)); 
+    }
+}
+
+// Modbus Callback
+bool cb(Modbus::ResultCode event, uint16_t, void*) { return true; }
+
+// ---------------- SETUP ----------------
+void setup() {
+    Serial.begin(115200);
+    meuEncoder.begin();
+
+    // Modbus em Serial2
+    Serial2.begin(115200, SERIAL_8N1, PINO_RX_RS485, PINO_TX_RS485);
+    mestre.begin(&Serial2, PINO_CONTROLE_RS485);
+    mestre.master();
+
+    // Task de controle no Core 1 (Separada do Loop/Modbus)
+    xTaskCreatePinnedToCore(TaskControle, "TaskControle", 4096, NULL, 1, NULL, 1);
+
+    Serial.println("--- Sistema de Controle Iniciado ---");
+    Serial.println("Comandos: 'run', 'stop', 'reset' ou valor de RPM (ex: 1200)");
+}
+
+// ---------------- LOOP (MODBUS E SERIAL INPUT) ----------------
+void loop() {
+    mestre.task();
+    meuEncoder.loop();
+    checkSerial(); // Verifica entrada do usuário sem travar
+
+    if (mestre.slave()) return;
+
+    // Máquina de estados Modbus
+    if (millis() > proximaTarefa) {
+        switch (modbusState) {
+            case 0: mestre.writeHreg(ID_INVERSOR, REG_RUN_CMD, comandoMotorDesejado, cb); break;
+            case 1: mestre.writeHreg(ID_INVERSOR, REG_SET_FREQ, frequenciaDesejada_raw, cb); break;
+            case 2: mestre.readHreg(ID_INVERSOR, REG_LEITURA_FREQ, &freq_raw, 1, cb); break;
+            case 3: mestre.readHreg(ID_INVERSOR, REG_LEITURA_TENSAO_SAIDA, &tensao_raw, 1, cb); break;
+            case 4: mestre.readHreg(ID_INVERSOR, REG_LEITURA_CORRENTE, &corrente_raw, 1, cb); break;
+            case 5: mestre.readHreg(ID_INVERSOR, REG_LEITURA_VELOCIDADE, &vel_raw, 1, cb); break;
+        }
+        modbusState++;
+        if (modbusState > 5) modbusState = 0;
+        proximaTarefa = millis() + MODBUS_CYCLE_TIME;
+    }
+}

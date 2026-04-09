@@ -1,0 +1,131 @@
+#include <Arduino.h>
+#include <ModbusRTU.h> // Biblioteca: emelianov/modbus-esp8266
+
+// --- Configurações do Inversor ---
+#define ID_INVERSOR 1
+
+// Registradores
+#define REG_RUN_CMD 8192
+#define REG_SET_FREQ 4096
+#define REG_LEITURA_FREQ 4097
+#define REG_LEITURA_TENSAO_SAIDA 4099
+#define REG_LEITURA_VELOCIDADE 4103
+#define REG_LEITURA_CORRENTE 28676
+
+// --- Pinos do ESP32 ---
+#define PINO_TX_RS485 17
+#define PINO_RX_RS485 16
+#define PINO_CONTROLE_RS485 4
+
+ModbusRTU mestre;
+
+// Variáveis de leitura
+uint16_t freq_raw = 0;
+uint16_t tensao_raw = 0;
+uint16_t corrente_raw = 0;
+uint16_t vel_raw = 0;
+
+// Variáveis de controle da máquina de estados
+int modbusState = 0;
+unsigned long proximaTarefa = 0;
+bool dadosImpressos = true;
+
+// Callback genérico
+bool cb(Modbus::ResultCode event, uint16_t, void*) {
+  if (event == Modbus::EX_SUCCESS) {
+    Serial.println("  ✔ ... Sucesso!");
+  } else {
+    Serial.printf("  ❌ ... Erro Modbus: 0x%02X\n", event);
+  }
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n==============================================");
+  Serial.println("ESP32 - Mestre Modbus (Teoria B - Aumentando Tempo)");
+  Serial.println("==============================================");
+
+  // Mantenha 9600. É o mais estável.
+  Serial2.begin(9600, SERIAL_8N1, PINO_RX_RS485, PINO_TX_RS485);
+  
+  mestre.begin(&Serial2, PINO_CONTROLE_RS485);
+  mestre.master();
+}
+
+void imprimirDados() {
+  Serial.println("\n=== Dados Lidos ===");
+  Serial.printf("Frequência: %.2f Hz\n", freq_raw / 100.0);
+  Serial.printf("Velocidade: %d RPM\n", vel_raw);
+  Serial.printf("Tensão: %.1f V\n", tensao_raw);
+  Serial.printf("Corrente: %.2f A\n", corrente_raw / 100.0);
+  Serial.println("====================\n");
+}
+
+
+void loop() {
+  mestre.task();
+
+  // Se a biblioteca está ocupada (mestre.slave() == true), não faça nada.
+  if (mestre.slave()) {
+    return;
+  }
+
+  // Se a biblioteca está livre E é hora da próxima tarefa
+  if (millis() > proximaTarefa) {
+
+    switch (modbusState) {
+      case 0:
+        Serial.println("-----------------------------------------");
+        Serial.println("-> (Estado 0) Enviando comando RUN (motor ligado)");
+        mestre.writeHreg(ID_INVERSOR, REG_RUN_CMD, 1, cb);
+        dadosImpressos = false; 
+        break;
+
+      case 1:
+        Serial.println("-> (Estado 1) Comandando inversor para 60.00 Hz");
+        mestre.writeHreg(ID_INVERSOR, REG_SET_FREQ, 7500, cb);
+        break;
+
+      case 2:
+        Serial.println("-> (Estado 2) Solicitando Leitura de Frequência...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_FREQ, &freq_raw, 1, cb);
+        break;
+
+      case 3:
+        Serial.println("-> (Estado 3) Solicitando Leitura de Velocidade...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_VELOCIDADE, &vel_raw, 1, cb);
+        break;
+
+      case 4:
+        Serial.println("-> (Estado 4) Solicitando Leitura de Tensão...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_TENSAO_SAIDA, &tensao_raw, 1, cb);
+        break;
+
+      case 5:
+        Serial.println("-> (Estado 5) Solicitando Leitura de Corrente...");
+        mestre.readHreg(ID_INVERSOR, REG_LEITURA_CORRENTE, &corrente_raw, 1, cb);
+        break;
+
+      case 6:
+        if (!dadosImpressos) {
+          imprimirDados();
+          dadosImpressos = true;
+        }
+        break;
+    }
+
+    modbusState++;
+    
+    if (modbusState > 6) {
+      modbusState = 0; 
+      proximaTarefa = millis() + 5000; // 5s de espera antes de recomeçar o ciclo
+    } else {
+      //
+      // !!!!!!!!!!!!!!!!!!! AQUI ESTÁ A MUDANÇA !!!!!!!!!!!!!!!!!!!
+      // Dando 1 segundo (1000ms) entre CADA comando.
+      //
+      proximaTarefa = millis() + 1000;
+    }
+  }
+}
