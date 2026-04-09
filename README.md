@@ -14,7 +14,7 @@ Transformar uma BeagleBone em uma IHM industrial autônoma. O sistema operaciona
 ## 💻 Software e Tecnologias
 * **Sistema Operacional:** Debian 11 (Bullseye) com ambiente gráfico (XFCE/LightDM).
 * **Linguagem Principal:** Python 3
-* **Interface Gráfica:** (Coloque aqui se usou Tkinter, PyQt5, etc.)
+* **Interface Gráfica:** (Tkinter, pyserial, matplotlib,threading, re, time, collections.)
 * **Controle de Vídeo/Toque:** Servidor Xorg / X11 (`xinput-calibrator`).
 
 ## ⚙️ Principais Desafios e Soluções Abordadas
