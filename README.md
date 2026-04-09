@@ -25,7 +25,7 @@ Este repositório documenta não apenas o código, mas as configurações de bai
 
 ## 📖 Como Usar / Guia de Instalação
 O guia completo detalhando cada comando desde a gravação do cartão SD, configuração do painel, calibração do toque e instalação das dependências está disponível no arquivo:
-👉 [Manual de Configuracao - BeagleBone.pdf](link_para_o_seu_pdf_ou_arquivo_markdown_aqui)
+👉 [Manual de Configuracao - BeagleBone.pdf](https://docs.google.com/document/d/1qPbW_UKzkaNFS0DHclRR7wraCRruQvw48oqZS8Dt150/edit?usp=sharing)
 
 ## 👨‍💻 Autores
 
